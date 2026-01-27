@@ -38,6 +38,7 @@
 
 #include <vector>
 #include <cstdlib>
+#include <omp.h>
 
 #include <boost/bind.hpp>
 #include <Eigen/Core>
@@ -2203,6 +2204,327 @@ public:
 				}
 				return;
 			}
+		}
+	}
+
+	void update_iterated_dyn_share_modified(double &solve_time) {
+		
+		dyn_share_datastruct<scalar_type> dyn_share;
+		dyn_share.valid = true;
+		dyn_share.converge = true;
+		int t = 0;
+		state x_propagated = x_;
+		cov P_propagated = P_;
+		int dof_Measurement; 
+		
+		Matrix<scalar_type, n, 1> K_h;
+		Matrix<scalar_type, n, n> K_x; 
+		
+		vectorized_state dx_new = vectorized_state::Zero();
+		for(int i=-1; i<maximum_iter; i++)
+		{
+			dyn_share.valid = true;	
+			h_dyn_share(x_, dyn_share);
+
+			// Even if I don't have any effective points, I keep solving the KF using the odometry from PX4
+			// !!!!! I CANNOT DO IT LIKE THIS!! I DON'T HAVE ANY MEASUREMENT OF THE ORIENTATION, I HAVE ONLY POSITION!
+			// Maybe I can use odometry if this becomes not valid
+			// NOTE: GET RID OF THE return IN laserMapping.cpp LINE 843 to have h, h_x and R correctly filled
+			if(! dyn_share.valid)
+			{
+				continue; 
+			}
+
+			MatrixXd R = dyn_share.R;
+			//Matrix<scalar_type, Eigen::Dynamic, 1> h = h_dyn_share(x_, dyn_share);
+			#ifdef USE_sparse
+				spMt h_x_ = dyn_share.h_x.sparseView();
+			#else
+				Eigen::Matrix<scalar_type, Eigen::Dynamic, n> h_x_ = dyn_share.h_x;
+			#endif
+			double solve_start = omp_get_wtime();
+			dof_Measurement = h_x_.rows();
+			vectorized_state dx;
+			x_.boxminus(dx, x_propagated);
+			dx_new = dx;
+			
+			P_ = P_propagated;
+			
+			Matrix<scalar_type, 3, 3> res_temp_SO3;
+			MTK::vect<3, scalar_type> seg_SO3;
+			int counter = 0;
+			for (std::vector<std::pair<int, int> >::iterator it = x_.SO3_state.begin(); it != x_.SO3_state.end(); it++) {
+				int idx = (*it).first;
+				int dim = (*it).second;
+				for(int i = 0; i < 3; i++){
+					seg_SO3(i) = dx(idx+i);
+					counter++;
+				}
+
+				res_temp_SO3 = MTK::A_matrix(seg_SO3).transpose();
+				dx_new.template block<3, 1>(idx, 0) = res_temp_SO3 * dx_new.template block<3, 1>(idx, 0);
+				for(int i = 0; i < n; i++){
+					P_. template block<3, 1>(idx, i) = res_temp_SO3 * (P_. template block<3, 1>(idx, i));	
+				}
+				for(int i = 0; i < n; i++){
+					P_. template block<1, 3>(i, idx) =(P_. template block<1, 3>(i, idx)) *  res_temp_SO3.transpose();	
+				}
+			}
+
+			Matrix<scalar_type, 2, 2> res_temp_S2;
+			MTK::vect<2, scalar_type> seg_S2;
+			for (std::vector<std::pair<int, int> >::iterator it = x_.S2_state.begin(); it != x_.S2_state.end(); it++) {
+				int idx = (*it).first;
+				int dim = (*it).second;
+				for(int i = 0; i < 2; i++){
+					seg_S2(i) = dx(idx + i);
+				}
+
+				Eigen::Matrix<scalar_type, 2, 3> Nx;
+				Eigen::Matrix<scalar_type, 3, 2> Mx;
+				x_.S2_Nx_yy(Nx, idx);
+				x_propagated.S2_Mx(Mx, seg_S2, idx);
+				res_temp_S2 = Nx * Mx; 
+				dx_new.template block<2, 1>(idx, 0) = res_temp_S2 * dx_new.template block<2, 1>(idx, 0);
+				for(int i = 0; i < n; i++){
+					P_. template block<2, 1>(idx, i) = res_temp_S2 * (P_. template block<2, 1>(idx, i));	
+				}
+				for(int i = 0; i < n; i++){
+					P_. template block<1, 2>(i, idx) = (P_. template block<1, 2>(i, idx)) * res_temp_S2.transpose();
+				}
+			}
+			//Matrix<scalar_type, n, Eigen::Dynamic> K_;
+			//Matrix<scalar_type, n, 1> K_h;
+			//Matrix<scalar_type, n, n> K_x; 
+
+			/*
+			if(n > dof_Measurement)
+			{
+				K_= P_ * h_x_.transpose() * (h_x_ * P_ * h_x_.transpose()/R + Eigen::Matrix<double, Dynamic, Dynamic>::Identity(dof_Measurement, dof_Measurement)).inverse()/R;
+			}
+			else
+			{
+				K_= (h_x_.transpose() * h_x_ + (P_/R).inverse()).inverse()*h_x_.transpose();
+			}
+			*/
+
+			MatrixXd K_;
+			if(n > dof_Measurement)
+			{
+				// #ifdef USE_sparse
+
+				// It's ok to invert R because we have small matrices here
+
+				/* // Use this when considering the lidar measurements
+				// I need to reconstruct the matrix R
+				MatrixXd R_reconstructed(dof_Measurement, dof_Measurement);
+				R_reconstructed.setZero();
+				R_reconstructed.diagonal() = VectorXd::Constant(dof_Measurement, R(0,0));
+				R_reconstructed.bottomRightCorner(9, 9) = R.bottomRightCorner(9, 9);
+				K_ = P_ * h_x_.transpose() * (h_x_ * P_ * h_x_.transpose() + R_reconstructed).inverse();
+				*/
+
+				K_ = P_ * h_x_.transpose() * (h_x_ * P_ * h_x_.transpose() + R).inverse();
+				K_h = K_ * dyn_share.h;
+				K_x = K_ * h_x_;
+			}
+			else
+			{
+			#ifdef USE_sparse
+				//Eigen::Matrix<scalar_type, n, n> b = Eigen::Matrix<scalar_type, n, n>::Identity();
+				//Eigen::SparseQR<Eigen::SparseMatrix<scalar_type>, Eigen::COLAMDOrdering<int>> solver; 
+				spMt A = h_x_.transpose() * h_x_;
+				cov P_temp = (P_/R).inverse();
+				P_temp. template block<12, 12>(0, 0) += A;
+				P_temp = P_temp.inverse();
+				/*
+				Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> h_x_cur = Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic>::Zero(dof_Measurement, n);
+				h_x_cur.col(0) = h_x_.col(0);
+				h_x_cur.col(1) = h_x_.col(1);
+				h_x_cur.col(2) = h_x_.col(2);
+				h_x_cur.col(3) = h_x_.col(3);
+				h_x_cur.col(4) = h_x_.col(4);
+				h_x_cur.col(5) = h_x_.col(5);
+				h_x_cur.col(6) = h_x_.col(6);
+				h_x_cur.col(7) = h_x_.col(7);
+				h_x_cur.col(8) = h_x_.col(8);
+				h_x_cur.col(9) = h_x_.col(9);
+				h_x_cur.col(10) = h_x_.col(10);
+				h_x_cur.col(11) = h_x_.col(11);
+				*/
+				K_ = P_temp. template block<n, 12>(0, 0) * h_x_.transpose();
+				K_x = cov::Zero();
+				K_x. template block<n, 12>(0, 0) = P_inv. template block<n, 12>(0, 0) * HTH;
+				/*
+				solver.compute(R_);
+				Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> R_in_temp = solver.solve(b);
+				spMt R_in =R_in_temp.sparseView();
+				spMt K_temp = h_x.transpose() * R_in * h_x;
+				cov P_temp = P_.inverse();
+				P_temp += K_temp;
+				K_ = P_temp.inverse() * h_x.transpose() * R_in;
+				*/
+			#else
+				std::cout << "YOU SHOULDN'T BE HERE..." << std::endl;
+				// Reconstruct matrix R
+				MatrixXd inv_R_reconstructed(dof_Measurement, dof_Measurement);
+				inv_R_reconstructed.setZero();
+				inv_R_reconstructed.diagonal() = VectorXd::Constant(dof_Measurement, 1 / R(0,0));
+				// inv_R_reconstructed.bottomRightCorner(9, 9) = R.bottomRightCorner(9, 9).inverse();
+				// The inverse of a block matrix is the matrix with all blocks inverted
+				inv_R_reconstructed.block<3, 3>(dof_Measurement - 9, dof_Measurement - 9) = R.block<3, 3>(1, 1).inverse();
+				inv_R_reconstructed.block<3, 3>(dof_Measurement - 6, dof_Measurement - 6) = R.block<3, 3>(4, 4).inverse();
+				inv_R_reconstructed.block<3, 3>(dof_Measurement - 3, dof_Measurement - 3) = R.block<3, 3>(7, 7).inverse();
+				K_ = (h_x_.transpose() * inv_R_reconstructed * h_x_ + P_.inverse()).inverse() * h_x_.transpose() * inv_R_reconstructed;
+				K_h = K_ * dyn_share.h;
+				K_x = K_ * h_x_;
+			#endif 
+			}
+
+			//K_x = K_ * h_x_;
+			// NOTE: When ignoring scan use these lines below...
+			VectorXd innovation(dof_Measurement);
+			innovation.head(6) = dyn_share.z.head(6) - dyn_share.h.head(6);
+			Quaterniond q_measured;
+			q_measured.w() = 1 - dyn_share.z.segment(6, 3).norm();
+			q_measured.vec() = dyn_share.z.segment(6, 3);
+			q_measured.normalize();
+			Quaterniond q_model;
+			q_model.w() = 1 - dyn_share.h.segment(6, 3).norm();
+			q_model.vec() = dyn_share.h.segment(6, 3);
+			q_model.normalize();
+			// Using directly quaternions to compute the error quat
+			// Matrix3d q_meas_skew = SKEW_SYM_MATRX(q_measured.vec());
+			q_model = q_model.conjugate();
+			Vector3d q_error_vec = q_measured.w() * q_model.vec() + q_model.w() * q_measured.vec() + q_measured.vec().cross(q_model.vec());
+			innovation.segment(6, 3) = q_error_vec;
+			// innovation.segment(3, 3) = Quaterniond(q_measured.normalized().matrix() * q_model.normalized().matrix().transpose()).normalized().vec();
+			innovation.tail(6) = dyn_share.z.tail(6) - dyn_share.h.tail(6);
+			// ...until here
+
+			/* // Use these lines if considering the lidar
+			VectorXd innovation(dof_Measurement);
+
+			// Using quaternions:
+			innovation.head(dof_Measurement - 9) = - dyn_share.h.head(dof_Measurement - 9);
+			// Comparing quaternions:
+			innovation.segment(dof_Measurement - 9, 3) = dyn_share.z.segment(dof_Measurement - 9, 3) - dyn_share.h.segment(dof_Measurement - 9, 3);
+			Quaterniond q_measured;
+			q_measured.w() = 1.0 - dyn_share.z.segment(dof_Measurement - 6, 3).norm();
+			q_measured.vec() = dyn_share.z.segment(dof_Measurement - 6, 3);
+			q_measured.normalize();
+			Quaterniond q_model;
+			q_model.w() = 1.0 - dyn_share.h.segment(dof_Measurement - 6, 3).norm();
+			q_model.vec() = dyn_share.h.segment(dof_Measurement - 6, 3);
+			q_model.normalize();
+			// Using directly quaternions to compute the error quat
+			Quaterniond q_model_conj = q_model.conjugate();
+			Vector3d q_error_vec = q_measured.w() * q_model_conj.vec() + q_model_conj.w() * q_measured.vec() + q_measured.vec().cross(q_model_conj.vec());
+			innovation.segment(dof_Measurement - 6, 3) = q_error_vec.normalized();
+			innovation.tail(3) = dyn_share.z.tail(3) - dyn_share.h.tail(3);
+			*/
+			
+
+			// In questa differenza (z-h) devo considerare che c'è un quaternione! Devo calcolare il quaternione errore e normalizzarlo, poi moltiplico per K_
+			// Matrix<scalar_type, n, 1> dx_ = K_ * (dyn_share.z - dyn_share.h) + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new; // eq 18 FAST-LIO. The term (z-h) is found at line 1111
+			Matrix<scalar_type, n, 1> dx_ = K_ * innovation + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new; // eq 18 FAST-LIO. The term (z-h) is found at line 1111
+			state x_before = x_;
+			x_.boxplus(dx_);
+			x_.rot.normalize();
+			x_.rot_gps_imu.normalize();
+			// x_.offset_R_L_I.normalize();
+			dyn_share.converge = true;
+			for(int jj = 0; jj < n ; jj++)
+			{
+				if(std::fabs(dx_[jj]) > 0.0001 /*limit[i]*/) // If the increment of at least one dx is bigger than limit[], then the kf did not converge yet
+				{
+					dyn_share.converge = false;
+					break;
+				}
+			}
+			if(dyn_share.converge) t++;
+			
+			if(!t && i == maximum_iter - 2)
+			{
+				dyn_share.converge = true;
+			}
+			// std::cout << "iteration time t=" << t << ", i=" << i << ". Is converged: " << dyn_share.converge << std::endl;
+			if(t > 1 || i == maximum_iter - 1)
+			{
+				L_ = P_;
+				// if (i == maximum_iter - 1)
+				// {
+					std::cout << "iteration time t=" << t << ", i=" << i << std::endl; 
+				// }
+				// std::cout << "Projecting P in the correct state space..." << std::endl;
+				Matrix<scalar_type, 3, 3> res_temp_SO3;
+				MTK::vect<3, scalar_type> seg_SO3;
+				for(typename std::vector<std::pair<int, int> >::iterator it = x_.SO3_state.begin(); it != x_.SO3_state.end(); it++) {
+					int idx = (*it).first;
+					for(int i = 0; i < 3; i++){
+						seg_SO3(i) = dx_(i + idx);
+					}
+					res_temp_SO3 = MTK::A_matrix(seg_SO3).transpose();
+					for(int i = 0; i < n; i++){
+						L_. template block<3, 1>(idx, i) = res_temp_SO3 * (P_. template block<3, 1>(idx, i)); 
+					}
+					// if(n > dof_Measurement)
+					// {
+					// 	for(int i = 0; i < dof_Measurement; i++){
+					// 		K_.template block<3, 1>(idx, i) = res_temp_SO3 * (K_. template block<3, 1>(idx, i));
+					// 	}
+					// }
+					// else
+					// {
+						for(int i = 0; i < n; i++){
+							K_x. template block<3, 1>(idx, i) = res_temp_SO3 * (K_x. template block<3, 1>(idx, i));
+						}
+					//}
+					for(int i = 0; i < n; i++){
+						L_. template block<1, 3>(i, idx) = (L_. template block<1, 3>(i, idx)) * res_temp_SO3.transpose();
+						P_. template block<1, 3>(i, idx) = (P_. template block<1, 3>(i, idx)) * res_temp_SO3.transpose();
+					}
+				}
+
+				Matrix<scalar_type, 2, 2> res_temp_S2;
+				MTK::vect<2, scalar_type> seg_S2;
+				for(typename std::vector<std::pair<int, int> >::iterator it = x_.S2_state.begin(); it != x_.S2_state.end(); it++) {
+					int idx = (*it).first;
+					for(int i = 0; i < 2; i++){
+						seg_S2(i) = dx_(i + idx);
+					}
+
+					Eigen::Matrix<scalar_type, 2, 3> Nx;
+					Eigen::Matrix<scalar_type, 3, 2> Mx;
+					x_.S2_Nx_yy(Nx, idx);
+					x_propagated.S2_Mx(Mx, seg_S2, idx);
+					res_temp_S2 = Nx * Mx; 
+					for(int i = 0; i < n; i++){
+						L_. template block<2, 1>(idx, i) = res_temp_S2 * (P_. template block<2, 1>(idx, i)); 
+					}
+					// if(n > dof_Measurement)
+					// {
+					// 	for(int i = 0; i < dof_Measurement; i++){
+					// 		K_. template block<2, 1>(idx, i) = res_temp_S2 * (K_. template block<2, 1>(idx, i));
+					// 	}
+					// }
+					// else
+					// {
+						for(int i = 0; i < n; i++){
+							K_x. template block<2, 1>(idx, i) = res_temp_S2 * (K_x. template block<2, 1>(idx, i));
+						}
+					//}
+					for(int i = 0; i < n; i++){
+						L_. template block<1, 2>(i, idx) = (L_. template block<1, 2>(i, idx)) * res_temp_S2.transpose();
+						P_. template block<1, 2>(i, idx) = (P_. template block<1, 2>(i, idx)) * res_temp_S2.transpose();
+					}
+				}
+
+				P_ = L_ - K_x * P_;
+				solve_time += omp_get_wtime() - solve_start;
+				return;
+			}
+			solve_time += omp_get_wtime() - solve_start;
 		}
 	}
 	
