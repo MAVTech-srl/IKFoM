@@ -2386,17 +2386,17 @@ public:
 			VectorXd innovation(dof_Measurement);
 			innovation.head(6) = dyn_share.z.head(6) - dyn_share.h.head(6);
 			Quaterniond q_measured;
-			q_measured.w() = 1 - dyn_share.z.segment(6, 3).norm();
+			q_measured.w() = sqrt( 1 - dyn_share.z.segment(6, 3).squaredNorm() );
 			q_measured.vec() = dyn_share.z.segment(6, 3);
 			q_measured.normalize();
 			Quaterniond q_model;
-			q_model.w() = 1 - dyn_share.h.segment(6, 3).norm();
+			q_model.w() = sqrt( 1 - dyn_share.h.segment(6, 3).squaredNorm() );
 			q_model.vec() = dyn_share.h.segment(6, 3);
 			q_model.normalize();
 			// Using directly quaternions to compute the error quat
 			// Matrix3d q_meas_skew = SKEW_SYM_MATRX(q_measured.vec());
-			q_model = q_model.conjugate();
-			Vector3d q_error_vec = q_measured.w() * q_model.vec() + q_model.w() * q_measured.vec() + q_measured.vec().cross(q_model.vec());
+			Quaterniond q_model_conj = q_model.conjugate();
+			Vector3d q_error_vec = q_measured.w() * q_model_conj.vec() + q_model_conj.w() * q_measured.vec() + q_measured.vec().cross(q_model_conj.vec());
 			innovation.segment(6, 3) = q_error_vec;
 			// innovation.segment(3, 3) = Quaterniond(q_measured.normalized().matrix() * q_model.normalized().matrix().transpose()).normalized().vec();
 			innovation.tail(6) = dyn_share.z.tail(6) - dyn_share.h.tail(6);
