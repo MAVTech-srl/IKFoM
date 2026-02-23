@@ -2454,7 +2454,7 @@ public:
 				L_ = P_;
 				// if (i == maximum_iter - 1)
 				// {
-					std::cout << "iteration time t=" << t << ", i=" << i << std::endl; 
+					// std::cout << "iteration time t=" << t << ", i=" << i << std::endl; 
 				// }
 				// std::cout << "Projecting P in the correct state space..." << std::endl;
 				Matrix<scalar_type, 3, 3> res_temp_SO3;
